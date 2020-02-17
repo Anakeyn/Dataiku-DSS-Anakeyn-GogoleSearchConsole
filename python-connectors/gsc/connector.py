@@ -60,10 +60,15 @@ class MyConnector(Connector):
             self.from_date = date.today() - timedelta(days=30*16)
             self.to_date = date.today() - timedelta(days=1)                         
         if (self.period=="Personalized") :
-            #beware !! dates are in string in the forms
+            #beware !! dates are in string in the forms, and there is a shift error of one minus day
             self.from_date = datetime.strptime( self.config.get("from_date")[:10], '%Y-%m-%d')
+            #avoid shift error
+            self.from_date = self.from_date + timedelta(days=1)             
+       
             self.to_date = datetime.strptime( self.config.get("to_date")[:10], '%Y-%m-%d')
-
+            #avoid shift error
+            self.to_date = self.to_date + timedelta(days=1) 
+        
         if self.to_date < self.from_date:
             raise ValueError("The end date occurs before the start date")  
         
@@ -133,18 +138,72 @@ class MyConnector(Connector):
 
 
         ###############################################################################
-        #Get Data  Pages/Queries/positions from Google Search Console
+        #Get Data  Pages/Queries/positions/Clicks from Google Search Console
         ###############################################################################
 
-        
-        dfGSC = pd.DataFrame()  #global dataframe
+        dfAllTraffic = pd.DataFrame()  #global dataframe for all traffic calculation
+        dfGSC = pd.DataFrame()  #global dataframe for clicks
         #convert dates in strings
         myStrStartDate = self.from_date.strftime('%Y-%m-%d') 
         myStrEndDate = self.to_date.strftime('%Y-%m-%d') 
 
+         
+        ####### Get Global Traffic ##############
+
         
         maxStartRow = 1000000000 #to avoid infinite loop
         myStartRow = 0
+        
+  
+        
+        while ( myStartRow < maxStartRow):
+            
+            df = pd.DataFrame() #dataframe for this loop
+            
+            
+            mySiteUrl = self.plugin_config.get("webSite")
+            myRequest = {
+                'startDate': myStrStartDate,    #older date
+                'endDate': myStrEndDate,      #most recent date
+                'dimensions': ["date", "country", "device"],
+                'searchType': 'web',         #for the moment only Web 
+                'rowLimit': 25000,         #max 25000 for one Request 
+                "aggregationType": "byPage",
+                'startRow' :  myStartRow                #  for multiple resquests 'startRow':
+                }
+
+            response =  self.webmasters_service.searchanalytics().query(siteUrl=mySiteUrl, body=myRequest).execute()
+
+
+            
+            #set response (dict) in DataFrame for treatments purpose.
+            df = pd.DataFrame.from_dict(response['rows'], orient='columns')
+
+            if ( myStartRow == 0) :
+                dfAllTraffic = df  #save the first loop df in global df
+            else :
+                dfAllTraffic = pd.concat([dfAllTraffic, df], ignore_index=True) #concat  this loop df  with  global df
+
+            if (df.shape[0]==25000) :
+                myStartRow += 25000  #continue
+            else :
+                 myStartRow = maxStartRow+1  #stop
+        
+        #split keys in date country device
+        dfAllTraffic[["date", "country", "device"]] = pd.DataFrame(dfAllTraffic["keys"].values.tolist())
+        dfAllTraffic =  dfAllTraffic.drop(columns=['keys'])  #remove Keys (not used)
+        
+        myTotalClicks = dfAllTraffic['clicks'].sum()
+        myTotalImpressions = dfAllTraffic['impressions'].sum()
+        
+        
+        
+         ####### Get Pages/Queries/positions/Clicks ##############
+        
+        maxStartRow = 1000000000 #to avoid infinite loop
+        myStartRow = 0
+        
+  
         
         while ( myStartRow < maxStartRow):
             
@@ -181,8 +240,34 @@ class MyConnector(Connector):
         #split keys in date query page country device
         dfGSC[["date", "query", "page", "country", "device"]] = pd.DataFrame(dfGSC["keys"].values.tolist())
         dfGSC =  dfGSC.drop(columns=['keys'])  #remove Keys (not used)
-
         
+        
+        mySampleClicks = dfGSC['clicks'].sum()
+        mySampleImpressions = dfGSC['impressions'].sum()
+                
+        
+        #Recalculate new clicks and Impressions
+        #recalculate All Clicks according to clicks volume ratio (we privilegiate clicks accuracy)
+        dfGSC['allClicks'] = dfGSC.apply(lambda x : round((x['clicks']*myTotalClicks)/mySampleClicks, 0),axis=1)
+        #Recalculate news All Impressions according to clicks volume ratio
+        dfGSC['allImpressions'] = dfGSC.apply(lambda x : round((x['impressions']*myTotalClicks)/mySampleClicks, 0),axis=1) 
+        #Reclaculate news All ctr according to new All impressions and Clicks
+        dfGSC['allCTR'] = dfGSC.apply(lambda x : x['allClicks']/x['allImpressions'],axis=1) 
+         
+        #remove bad dates 
+        #Change string date in datetime
+        dfGSC['date'] = dfGSC.apply(lambda x : datetime.strptime( x['date'][:10], '%Y-%m-%d'),axis=1) 
+        mask = (dfGSC['date'] >= self.from_date) & (dfGSC['date'] <= self.to_date)
+        dfGSC = dfGSC.loc[mask]    
+        dfGSC.reset_index(inplace=True, drop=True)  #reset index
+        
+        #remove old clicks, ctr and impression columns
+        dfGSC =  dfGSC.drop(columns=['clicks', 'ctr', 'impressions'])
+        #rename All impressions, ctr and clicks in old names
+        dfGSC.rename(columns={'allImpressions':'impressions', 'allClicks':'clicks', 'allCTR':'ctr'}, inplace=True)
+        
+        #reorganise in orignal order clicks, ctr, impressions, positions, date, query, page, country, device
+        dfGSC = dfGSC[["clicks", "ctr", "impressions", "position", "date", "query", "page", "country", "device"]]
         #send rows got in dataframe transformed in dict 
         for row in dfGSC.to_dict(orient='records'):
             yield row  #Each yield in the generator becomes a row in the dataset.
